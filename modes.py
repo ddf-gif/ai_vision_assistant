@@ -14,6 +14,7 @@ import sys
 
 import cv2
 
+from realtime_bot import BotCallback
 from utils import detect_speech_energy
 
 
@@ -111,8 +112,8 @@ def run_manual_mode(bot, camera, controller):
 
 # ==================== 自动模式 ====================
 
-# VAD 能量阈值（说话/静音分界线，RMS）
-_SPEECH_THRESHOLD = 500
+# VAD 能量阈值（说话/静音分界线，RMS），值越低越灵敏
+_SPEECH_THRESHOLD = 300
 # 待机超时（秒）：超过此时间无语音则关闭摄像头
 _STANDBY_TIMEOUT = 30.0
 # 待机唤醒缓冲区：检测到语音后需连续多少帧才唤醒（防误触发）
@@ -147,6 +148,7 @@ def run_auto_mode(bot, camera, controller):
     _in_standby = False               # 是否处于待机状态
     _wakeup_counter = 0               # 唤醒连续计数
     _running = True                    # 本地运行标志
+    _frame_count = 0                   # 帧计数（用于降频打印）
     bot._is_running = True             # 同步 bot 状态
 
     # 确保麦克风已打开
@@ -174,7 +176,14 @@ def run_auto_mode(bot, camera, controller):
             continue
 
         # ---- VAD 语音检测 ----
+        energy = len(audio_data) // 2  # 仅用于下面的调试输出，实际能量在 detect_speech_energy 内计算
         is_speaking_now = detect_speech_energy(audio_data, _SPEECH_THRESHOLD)
+
+        # 每 50 帧（≈1 秒）打印一次能量，帮助校准阈值
+        _frame_count += 1
+        if _frame_count % 50 == 0:
+            rms = BotCallback.calculate_rms(audio_data)
+            print(f"[🔊] 当前能量: {rms:.0f} RMS (阈值: {_SPEECH_THRESHOLD})", end="\r")
 
         if is_speaking_now:
             # ---- 有语音 ----
