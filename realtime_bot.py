@@ -57,9 +57,14 @@ class BotCallback(OmniRealtimeCallback):
         self.assistant_speaking = False  # 助手是否正在说话（半双工回声抑制）
         self.is_speaking = False         # 同 assistant_speaking，供打断逻辑使用
         self._interrupted = False        # 当前回复是否被用户打断
-        self._cooldown_until = 0.0       # 冷却期结束时间戳（秒）
         self._voice_intr_cooldown = 0.0  # 语音打断冷却期（打断后 2 秒内不触发语音打断）
         self._post_intr_mute_until = 0.0  # 打断后静音期（打断后 500ms 内不发送麦克风数据）
+
+        # 能量门控（替代固定冷却期）：AI 说完后检测扬声器是否真正静音
+        self._waiting_silence = False     # 是否在等待扬声器静音
+        self._waiting_silence_start = 0.0 # 开始等待静音的时间戳
+        self._silence_frames = 0          # 连续低能量帧计数
+
         self._assistant_text = ""        # 流式文本缓冲区
 
     # ---- 音频能量计算（静态方法，供语音打断使用） ----
@@ -166,12 +171,13 @@ class BotCallback(OmniRealtimeCallback):
 
             # ---- 一轮回复结束 ----
             elif event_type == "response.done":
-                # WebSocket 保证 response.done 是该回复的最后一个事件，
-                # 之后不会再有其 audio.delta / transcript.delta，可安全解除封锁
+                # WebSocket 保证 response.done 是该回复的最后一个事件
                 self._interrupted = False
-                if not self._cooldown_until:
-                    # 正常结束：进入冷却期防止回声尾巴
-                    self._cooldown_until = time.time() + 0.5
+                if not self._interrupted:
+                    # 正常结束：进入能量门控模式，等待扬声器真正静音后再恢复拾音
+                    self._waiting_silence = True
+                    self._waiting_silence_start = time.time()
+                    self._silence_frames = 0
                 self.assistant_speaking = False
                 self.is_speaking = False
                 self._assistant_text = ""
@@ -186,8 +192,10 @@ class BotCallback(OmniRealtimeCallback):
             # ---- 错误 ----
             elif event_type == "error":
                 error_msg = response.get("error", {}).get("message", str(response))
-                # 忽略打断产生的预期错误（cancel 后服务端返回的正常响应）
+                # 忽略预期/无害的错误
                 if "none active response" in error_msg.lower():
+                    pass
+                elif "append image before append audio" in error_msg.lower():
                     pass
                 else:
                     print(f"\n⚠️ 模型返回错误: {error_msg}")
@@ -231,6 +239,8 @@ class RealtimeBot:
         energy_threshold: float = None,
         enable_keyboard_interrupt: bool = True,
         enable_voice_interrupt: bool = True,
+        camera=None,
+        video_interval: float = 2.0,
     ):
         """
         初始化语音对话机器人
@@ -244,6 +254,8 @@ class RealtimeBot:
             energy_threshold: 语音打断能量阈值（RMS），默认 600
             enable_keyboard_interrupt: 是否启用 ESC 键打断
             enable_voice_interrupt: 是否启用语音能量打断
+            camera: Camera 实例（可选），用于定时抓取画面发送给模型
+            video_interval: 自动发送视频帧的间隔（秒），默认 2.0
         """
         self.api_key = api_key
         self.voice = voice
@@ -253,6 +265,10 @@ class RealtimeBot:
         self.energy_threshold = energy_threshold or self.DEFAULT_ENERGY_THRESHOLD
         self.enable_keyboard_interrupt = enable_keyboard_interrupt
         self.enable_voice_interrupt = enable_voice_interrupt
+
+        # 摄像头（可选）
+        self.camera = camera
+        self.video_interval = video_interval
 
         # 音频设备
         self.pya = None
@@ -408,6 +424,32 @@ class RealtimeBot:
         # 方式 4：不可用
         return False
 
+    def send_video_frame(self, base64_image: str) -> bool:
+        """
+        发送一帧摄像头画面给模型。
+
+        调用 OmniRealtimeConversation.append_video() 将 base64 编码的
+        JPEG 图像沿 WebSocket 实时推送给 qwen3-omni-flash-realtime 模型。
+        模型会结合当前摄像头画面理解用户语音指令。
+
+        Args:
+            base64_image: JPEG 图像的 base64 编码字符串
+
+        Returns:
+            bool: 发送成功返回 True，失败返回 False
+        """
+        if not base64_image:
+            return False
+        if not self.conv:
+            return False
+
+        try:
+            self.conv.append_video(base64_image)
+            return True
+        except Exception as e:
+            print(f"\n⚠️ 发送视频帧失败: {e}")
+            return False
+
     def _do_interrupt(self):
         """
         执行打断操作：
@@ -427,7 +469,8 @@ class RealtimeBot:
         self.callback._interrupted = True
         self.callback.assistant_speaking = False
         self.callback.is_speaking = False
-        self.callback._cooldown_until = 0.0
+        self.callback._waiting_silence = False  # 清除能量门控
+        self.callback._silence_frames = 0
         self.callback._voice_intr_cooldown = time.time() + 2.0
         self.callback._post_intr_mute_until = time.time() + 0.5  # 打断后静音 500ms，防尾音回声
 
@@ -553,9 +596,22 @@ class RealtimeBot:
         # 能量历史（用于语音打断的连续帧检测，避免瞬态噪声误触发）
         _energy_history = []  # 最近 3 帧的能量值
 
+        # 视频帧定时发送
+        _last_video_send = 0.0      # 上次发送视频帧的时间戳
+        _audio_ever_sent = False    # 是否至少发送过一次音频（模型要求音频先于图像）
+
         try:
             while self._is_running:
                 try:
+                    # ---- 步骤 0：定时发送摄像头画面（需先发送过音频） ----
+                    if self.camera and self.conv and _audio_ever_sent:
+                        now = time.time()
+                        if now - _last_video_send >= self.video_interval:
+                            frame_b64 = self.camera.get_frame_base64()
+                            if frame_b64:
+                                self.send_video_frame(frame_b64)
+                                _last_video_send = now
+
                     # ---- 步骤 1：从麦克风读取音频 ----
                     audio_data = self.mic.read(3200, exception_on_overflow=False)
 
@@ -597,8 +653,22 @@ class RealtimeBot:
                         time.sleep(0.01)
                         continue
 
-                    # ========== 冷却期中 ==========
-                    if self.callback and time.time() < self.callback._cooldown_until:
+                    # ========== 能量门控：等待扬声器静音（替代固定冷却期）==========
+                    # AI 说完后不立即恢复拾音，而是检测麦克风能量——只有当扬声器
+                    # 确实没有声音了（能量低）才放行，从根本上杜绝回声转录为语音输入
+                    if self.callback and self.callback._waiting_silence:
+                        # 超时保护（最多等 3 秒）
+                        if time.time() - self.callback._waiting_silence_start > 3.0:
+                            self.callback._waiting_silence = False
+                            self.callback._silence_frames = 0
+                        # 能量低于静音阈值 → 累计静音帧
+                        elif energy < 200:  # 200 RMS ≈ 环境底噪
+                            self.callback._silence_frames += 1
+                            if self.callback._silence_frames >= 3:  # 连续 3 帧静音 ≈ 600ms
+                                self.callback._waiting_silence = False
+                                self.callback._silence_frames = 0
+                        else:
+                            self.callback._silence_frames = 0  # 有声音，重置计数
                         time.sleep(0.01)
                         continue
 
@@ -612,6 +682,7 @@ class RealtimeBot:
                         self.callback._post_intr_mute_until = 0.0
                         print("[系统] 已恢复聆听，请说话")
                     self.conv.append_audio(base64.b64encode(audio_data).decode())
+                    _audio_ever_sent = True  # 标记已发送过音频，允许后续视频帧发送
                     time.sleep(0.01)
 
                 except OSError as e:
