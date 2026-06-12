@@ -145,13 +145,15 @@ def run_auto_mode(bot, camera, controller):
     print("   [ESC] AI 说话时打断，未说话时退出对话")
     print("=" * 50)
 
-    last_video_send = 0.0
-    _audio_ever_sent = False
     _silence_start = time.time()      # 静音开始时间
     _in_standby = False               # 是否处于待机状态
     _wakeup_counter = 0               # 唤醒连续计数
     _running = True                    # 本地运行标志
     _frame_count = 0                   # 帧计数（用于降频打印）
+    _was_speaking = False              # 上一帧是否在说话（边沿检测）
+    last_video_send = 0.0              # 上次发送视频帧的时间戳
+    _audio_ever_sent = False           # API 要求音频先于视频
+    _first_frame_sent = False          # 本轮说话是否已发送首帧
     bot._is_running = True             # 同步 bot 状态
 
     # 确保麦克风已打开
@@ -221,28 +223,44 @@ def run_auto_mode(bot, camera, controller):
 
             controller.update_idle_timer(is_speaking=True)
 
+            # 检测说话开始边沿（静音→说话的瞬间）
+            speech_onset = is_speaking_now and not _was_speaking
+
             # 发送音频（AI 没在说话时）
             if bot.conv and bot.callback and not bot.callback.assistant_speaking:
                 bot.conv.append_audio(base64.b64encode(audio_data).decode())
                 _audio_ever_sent = True
 
-                # ---- 视频发送（CostController 驱动） ----
+                # ---- 视频发送 ----
+                # 策略：说话开始瞬间立刻发一帧（不等转录），让模型提前看到画面
+                # 后续按 CostController 帧率控制
                 if camera and _audio_ever_sent and not _in_standby:
                     now = time.time()
                     fps = controller.get_current_fps()
-                    if now - last_video_send >= 1.0 / fps:
-                        user_text = bot.callback.latest_user_text or ""
-                        bot.callback.latest_user_text = ""
-                        if controller.should_send_video(user_text):
-                            b64 = camera.get_frame_base64()
-                            if b64:
-                                bot.send_video_frame(b64)
-                                last_video_send = now
-                                status = "闲置保活" if controller.is_idle() else "意图触发"
-                                print(f"[📷 视觉] 发送画面 ({status}, {fps}fps)")
+                    should_send = False
+
+                    if speech_onset and not _first_frame_sent:
+                        # 刚开始说话 → 立刻发送首帧
+                        should_send = True
+                        _first_frame_sent = True
+                    elif now - last_video_send >= 1.0 / fps:
+                        # 按帧率发送后续帧
+                        should_send = True
+
+                    if should_send:
+                        b64 = camera.get_frame_base64()
+                        if b64:
+                            bot.send_video_frame(b64)
+                            last_video_send = now
+                            tag = "首帧" if speech_onset else ("闲置保活" if controller.is_idle() else "意图触发")
+                            if speech_onset:
+                                print(f"[📷 视觉] 发送画面 ({tag}, {fps}fps)")
+                            elif _frame_count % 50 == 0:
+                                print(f"[📷 视觉] 发送画面 ({tag}, {fps}fps)")
         else:
             # ---- 无语音 ----
             _wakeup_counter = 0
+            _first_frame_sent = False  # 本轮说话结束，下次说话重新发首帧
 
             if not _in_standby:
                 silent_duration = time.time() - _silence_start
@@ -259,4 +277,5 @@ def run_auto_mode(bot, camera, controller):
 
                 controller.update_idle_timer(is_speaking=False)
 
+        _was_speaking = is_speaking_now
         time.sleep(0.01)
