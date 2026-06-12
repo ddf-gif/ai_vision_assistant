@@ -66,6 +66,7 @@ class BotCallback(OmniRealtimeCallback):
         self._silence_frames = 0          # 连续低能量帧计数
 
         self._assistant_text = ""        # 流式文本缓冲区
+        self.latest_user_text = ""       # 最近一次用户语音识别文本（供成本控制器使用）
 
     # ---- 音频能量计算（静态方法，供语音打断使用） ----
 
@@ -167,6 +168,7 @@ class BotCallback(OmniRealtimeCallback):
             # ---- 用户语音识别 ----
             elif event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = response.get("transcript", "")
+                self.latest_user_text = transcript  # 存储供成本控制器做意图判断
                 print(f"\n[🎤 用户] {transcript}")
 
             # ---- 一轮回复结束 ----
@@ -241,6 +243,7 @@ class RealtimeBot:
         enable_voice_interrupt: bool = True,
         camera=None,
         video_interval: float = 2.0,
+        cost_controller=None,
     ):
         """
         初始化语音对话机器人
@@ -255,7 +258,8 @@ class RealtimeBot:
             enable_keyboard_interrupt: 是否启用 ESC 键打断
             enable_voice_interrupt: 是否启用语音能量打断
             camera: Camera 实例（可选），用于定时抓取画面发送给模型
-            video_interval: 自动发送视频帧的间隔（秒），默认 2.0
+            video_interval: 自动发送视频帧的间隔（秒），默认 2.0（使用 cost_controller 时被覆盖）
+            cost_controller: CostController 实例（可选），用于意图过滤和帧率动态调节
         """
         self.api_key = api_key
         self.voice = voice
@@ -269,6 +273,9 @@ class RealtimeBot:
         # 摄像头（可选）
         self.camera = camera
         self.video_interval = video_interval
+
+        # 成本控制器（可选）
+        self.cost_controller = cost_controller
 
         # 音频设备
         self.pya = None
@@ -596,15 +603,40 @@ class RealtimeBot:
         # 能量历史（用于语音打断的连续帧检测，避免瞬态噪声误触发）
         _energy_history = []  # 最近 3 帧的能量值
 
-        # 视频帧定时发送
+        # 视频帧发送（由 CostController 驱动意图过滤 + 帧率调节）
         _last_video_send = 0.0      # 上次发送视频帧的时间戳
         _audio_ever_sent = False    # 是否至少发送过一次音频（模型要求音频先于图像）
 
         try:
             while self._is_running:
                 try:
-                    # ---- 步骤 0：定时发送摄像头画面（需先发送过音频） ----
-                    if self.camera and self.conv and _audio_ever_sent:
+                    # ---- 步骤 0：成本控制驱动的摄像头画面发送 ----
+                    if self.camera and self.conv and _audio_ever_sent and self.cost_controller:
+                        now = time.time()
+                        fps = self.cost_controller.get_current_fps()
+                        interval = 1.0 / fps
+
+                        if now - _last_video_send >= interval:
+                            # 获取用户文本用于意图过滤
+                            user_text = ""
+                            if self.callback:
+                                user_text = self.callback.latest_user_text
+                                self.callback.latest_user_text = ""  # 消费后清空
+
+                            # 更新闲置计时器
+                            is_user_speaking = bool(user_text)
+                            self.cost_controller.update_idle_timer(is_user_speaking)
+
+                            # 意图过滤：用户想看画面或闲置保活时才发送
+                            if self.cost_controller.should_send_video(user_text):
+                                frame_b64 = self.camera.get_frame_base64()
+                                if frame_b64:
+                                    self.send_video_frame(frame_b64)
+                                    _last_video_send = now
+                                    status = "闲置保活" if self.cost_controller.is_idle() else "意图触发"
+                                    print(f"[📷 视觉] 发送画面 ({status}, {fps}fps)")
+                    elif self.camera and self.conv and _audio_ever_sent and not self.cost_controller:
+                        # 无 CostController 时退化为简单定时发送（兼容旧逻辑）
                         now = time.time()
                         if now - _last_video_send >= self.video_interval:
                             frame_b64 = self.camera.get_frame_base64()
