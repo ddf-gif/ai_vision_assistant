@@ -3,9 +3,13 @@
 
 基于 Qwen3-Omni-Flash-Realtime 模型的实时语音+视觉对话程序。
 从 .env 加载配置，创建 RealtimeBot 和 Camera 实例并启动对话。
-模型同时接收麦克风音频和摄像头画面，实现多模态交互。
+
+支持两种交互模式：
+  --mode manual  手动模式（按住空格键说话，松开停止）
+  --mode auto    自动模式（VAD 语音检测，自动判断）
 """
 
+import argparse
 import os
 import sys
 
@@ -19,55 +23,48 @@ from dotenv import load_dotenv
 from camera import Camera
 from controller import CostController
 from realtime_bot import RealtimeBot
+from modes import run_manual_mode, run_auto_mode
 
 # ---------- 加载环境变量 ----------
-# 从 .env 文件加载 DASHSCOPE_API_KEY
-# 若 .env 不存在，尝试从系统环境变量中读取
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(env_path):
     load_dotenv(env_path)
     print("📄 已加载 .env 配置文件")
 else:
-    # 尝试从系统环境变量获取
     print("📄 未找到 .env 文件，使用系统环境变量")
 
 # ---------- 配置参数 ----------
-# 从环境变量获取 API Key
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
-# 模型与音色配置（可根据需要修改）
-VOICE = "Ethan"  # 音色选择，可选值见 DashScope 文档
-MODEL = "qwen3-omni-flash-realtime"  # 模型名称
+VOICE = "Ethan"
+MODEL = "qwen3-omni-flash-realtime"
 INSTRUCTIONS = (
     "你是AI视觉助手，能看到摄像头画面并听到用户说话。"
     "用简短、口语化的中文回答，直接提供帮助。"
 )
 
 # 摄像头配置
-CAMERA_ID = 0          # 摄像头设备 ID，默认 0
-CAMERA_WIDTH = 640     # 捕获分辨率宽度
-CAMERA_HEIGHT = 480    # 捕获分辨率高度
-VIDEO_INTERVAL = 2.0   # 自动发送视频帧的间隔（秒）
+CAMERA_ID = 0
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+VIDEO_INTERVAL = 2.0
 
 # 打断功能配置
-ENABLE_KEYBOARD_INTERRUPT = True   # ESC 键打断 AI 回复
-ENABLE_VOICE_INTERRUPT = False     # 语音能量打断（需要耳机避免回声误触发，否则不推荐开启）
-ENERGY_THRESHOLD = 600             # 语音打断能量阈值（RMS），值越低越灵敏（200-2000）
+ENABLE_KEYBOARD_INTERRUPT = False  # 手动/自动模式下由 modes 管理，此处关闭
+ENABLE_VOICE_INTERRUPT = False
+ENERGY_THRESHOLD = 600
 
 
 def main():
-    """
-    主函数：创建并启动视觉语音对话机器人。
+    # ---- 命令行参数 ----
+    parser = argparse.ArgumentParser(description="视觉语音对话助手")
+    parser.add_argument(
+        "--mode", choices=["manual", "auto"], default="manual",
+        help="交互模式：manual=按住空格说话，auto=VAD 自动检测（默认 manual）",
+    )
+    args = parser.parse_args()
 
-    流程：
-    1. 检查 API Key 是否存在
-    2. 初始化摄像头和预览窗口
-    3. 创建 RealtimeBot 实例
-    4. 建立连接并配置会话
-    5. 打开麦克风开始对话
-    """
-
-    # 检查 API Key
+    # ---- 检查 API Key ----
     if not DASHSCOPE_API_KEY:
         print("=" * 50)
         print("❌ 错误：未找到 DASHSCOPE_API_KEY")
@@ -80,7 +77,7 @@ def main():
         print("  https://dashscope.console.aliyun.com/apiKey")
         sys.exit(1)
 
-    # 初始化摄像头
+    # ---- 初始化摄像头 ----
     camera = None
     try:
         camera = Camera(
@@ -88,16 +85,15 @@ def main():
             width=CAMERA_WIDTH,
             height=CAMERA_HEIGHT,
         )
-        camera.show_preview()
     except Exception as e:
         print(f"⚠️ 摄像头初始化失败: {e}")
         print("   将以纯语音模式运行（无视觉输入）")
 
-    # 初始化成本控制器（意图过滤 + 帧率动态调节）
+    # ---- 初始化成本控制器 ----
     cost_ctrl = CostController()
     print("💰 成本控制器已就绪 (活跃:1fps, 闲置:0.1fps, 超时:30s)")
 
-    # 创建视觉语音对话机器人
+    # ---- 创建 RealtimeBot ----
     bot = RealtimeBot(
         api_key=DASHSCOPE_API_KEY,
         voice=VOICE,
@@ -118,14 +114,16 @@ def main():
         # 打开麦克风
         bot.start_audio_input()
 
-        # 进入主循环（音频 + 视频）
-        bot.run()
+        # 根据模式启动对应的交互循环
+        if args.mode == "manual":
+            run_manual_mode(bot, camera, cost_ctrl)
+        elif args.mode == "auto":
+            run_auto_mode(bot, camera, cost_ctrl)
 
     except KeyboardInterrupt:
         print("\n\n🛑 程序被用户中断")
     except ConnectionError as e:
         print(f"\n❌ 网络连接错误: {e}")
-        print("请检查网络连接是否正常")
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ 发生未预期的错误: {e}")
