@@ -2,11 +2,11 @@
 视觉语音对话应用入口
 
 基于 Qwen3-Omni-Flash-Realtime 模型的实时语音+视觉对话程序。
-从 .env 加载配置，创建 RealtimeBot 和 Camera 实例并启动对话。
 
-支持两种交互模式：
-  --mode manual  手动模式（按住空格键说话，松开停止）
-  --mode auto    自动模式（VAD 语音检测，自动判断）
+运行模式：
+  python main.py                 默认 GUI 图形界面
+  python main.py --mode manual   控制台手动模式（空格键切换录音）
+  python main.py --mode auto     控制台自动模式（VAD 语音检测）
 """
 
 import argparse
@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 from camera import Camera
 from controller import CostController
 from realtime_bot import RealtimeBot
-from modes import run_manual_mode, run_auto_mode
 
 # ---------- 加载环境变量 ----------
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -50,17 +49,17 @@ CAMERA_HEIGHT = 480
 VIDEO_INTERVAL = 2.0
 
 # 打断功能配置
-ENABLE_KEYBOARD_INTERRUPT = False  # 手动/自动模式下由 modes 管理，此处关闭
+ENABLE_KEYBOARD_INTERRUPT = False
 ENABLE_VOICE_INTERRUPT = False
 ENERGY_THRESHOLD = 600
 
 
 def main():
     # ---- 命令行参数 ----
-    parser = argparse.ArgumentParser(description="视觉语音对话助手")
+    parser = argparse.ArgumentParser(description="AI视觉对话助手")
     parser.add_argument(
-        "--mode", choices=["manual", "auto"], default="manual",
-        help="交互模式：manual=按住空格说话，auto=VAD 自动检测（默认 manual）",
+        "--mode", choices=["gui", "manual", "auto"], default="gui",
+        help="运行模式：gui=图形界面(默认), manual=控制台手动, auto=控制台自动",
     )
     args = parser.parse_args()
 
@@ -87,7 +86,10 @@ def main():
         )
     except Exception as e:
         print(f"⚠️ 摄像头初始化失败: {e}")
-        print("   将以纯语音模式运行（无视觉输入）")
+        if args.mode == "gui":
+            print("   将以纯语音模式运行（GUI 左侧将显示提示）")
+        else:
+            print("   将以纯语音模式运行（无视觉输入）")
 
     # ---- 初始化成本控制器 ----
     cost_ctrl = CostController()
@@ -114,10 +116,17 @@ def main():
         # 打开麦克风
         bot.start_audio_input()
 
-        # 根据模式启动对应的交互循环
-        if args.mode == "manual":
+        # 根据模式启动
+        if args.mode == "gui":
+            from gui import AIAssistantGUI
+            print("🖥️ 正在启动图形界面...")
+            app = AIAssistantGUI(bot, camera, cost_ctrl)
+            app.run()
+        elif args.mode == "manual":
+            from modes import run_manual_mode
             run_manual_mode(bot, camera, cost_ctrl)
         elif args.mode == "auto":
+            from modes import run_auto_mode
             run_auto_mode(bot, camera, cost_ctrl)
 
     except KeyboardInterrupt:
@@ -131,11 +140,12 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # 释放资源
-        if bot:
-            bot.close()
-        if camera:
-            camera.release()
+        # GUI 模式在窗口关闭时自行释放资源
+        if args.mode != "gui":
+            if bot:
+                bot.close()
+            if camera:
+                camera.release()
 
 
 if __name__ == "__main__":
