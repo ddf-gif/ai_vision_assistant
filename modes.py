@@ -14,6 +14,7 @@ import sys
 
 import cv2
 
+from realtime_bot import BotCallback
 from utils import detect_speech_energy
 
 
@@ -35,7 +36,7 @@ def run_manual_mode(bot, camera, controller):
     """
     print("=" * 50)
     print("🎧 手动模式：按 [空格键] 切换录音（开/关）")
-    print("   [ESC] 退出对话")
+    print("   [ESC] AI 说话时打断，未说话时退出对话")
     print("=" * 50)
 
     push_to_talk = False
@@ -59,9 +60,12 @@ def run_manual_mode(bot, camera, controller):
         # ---- 键盘检测 ----
         key = cv2.waitKey(1) & 0xFF
 
-        if key == 27:  # ESC 退出
-            print("\n[系统] ESC 按下，退出对话")
-            break
+        if key == 27:  # ESC：AI 说话时打断，否则退出
+            if bot.callback and bot.callback.assistant_speaking:
+                bot._do_interrupt()
+            else:
+                print("\n[系统] ESC 按下，退出对话")
+                break
 
         # ---- 空格键边沿检测（按下瞬间切换）----
         space_pressed = (key == 32)
@@ -111,8 +115,8 @@ def run_manual_mode(bot, camera, controller):
 
 # ==================== 自动模式 ====================
 
-# VAD 能量阈值（说话/静音分界线，RMS）
-_SPEECH_THRESHOLD = 500
+# VAD 能量阈值（说话/静音分界线，RMS），值越低越灵敏
+_SPEECH_THRESHOLD = 300
 # 待机超时（秒）：超过此时间无语音则关闭摄像头
 _STANDBY_TIMEOUT = 30.0
 # 待机唤醒缓冲区：检测到语音后需连续多少帧才唤醒（防误触发）
@@ -138,15 +142,18 @@ def run_auto_mode(bot, camera, controller):
     print("=" * 50)
     print("🎧 自动模式：VAD 语音检测，自动判断说话/静音")
     print(f"   待机超时: {_STANDBY_TIMEOUT:.0f} 秒无语音后关闭摄像头")
-    print("   [ESC] 退出对话")
+    print("   [ESC] AI 说话时打断，未说话时退出对话")
     print("=" * 50)
 
-    last_video_send = 0.0
-    _audio_ever_sent = False
     _silence_start = time.time()      # 静音开始时间
     _in_standby = False               # 是否处于待机状态
     _wakeup_counter = 0               # 唤醒连续计数
     _running = True                    # 本地运行标志
+    _frame_count = 0                   # 帧计数（用于降频打印）
+    _was_speaking = False              # 上一帧是否在说话（边沿检测）
+    last_video_send = 0.0              # 上次发送视频帧的时间戳
+    _audio_ever_sent = False           # API 要求音频先于视频
+    _first_frame_sent = False          # 本轮说话是否已发送首帧
     bot._is_running = True             # 同步 bot 状态
 
     # 确保麦克风已打开
@@ -162,9 +169,12 @@ def run_auto_mode(bot, camera, controller):
 
         # ---- 键盘检测 ----
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC 退出
-            print("\n[系统] ESC 按下，退出对话")
-            break
+        if key == 27:  # ESC：AI 说话时打断，否则退出
+            if bot.callback and bot.callback.assistant_speaking:
+                bot._do_interrupt()
+            else:
+                print("\n[系统] ESC 按下，退出对话")
+                break
 
         # ---- 读取麦克风音频 ----
         try:
@@ -174,7 +184,14 @@ def run_auto_mode(bot, camera, controller):
             continue
 
         # ---- VAD 语音检测 ----
+        energy = len(audio_data) // 2  # 仅用于下面的调试输出
         is_speaking_now = detect_speech_energy(audio_data, _SPEECH_THRESHOLD)
+
+        # 每 50 帧（≈1 秒）打印一次能量，帮助校准阈值
+        _frame_count += 1
+        if _frame_count % 50 == 0:
+            rms = BotCallback.calculate_rms(audio_data)
+            print(f"[🔊] 当前能量: {rms:.0f} RMS (阈值: {_SPEECH_THRESHOLD})", end="\r")
 
         if is_speaking_now:
             # ---- 有语音 ----
@@ -206,28 +223,44 @@ def run_auto_mode(bot, camera, controller):
 
             controller.update_idle_timer(is_speaking=True)
 
+            # 检测说话开始边沿（静音→说话的瞬间）
+            speech_onset = is_speaking_now and not _was_speaking
+
             # 发送音频（AI 没在说话时）
             if bot.conv and bot.callback and not bot.callback.assistant_speaking:
                 bot.conv.append_audio(base64.b64encode(audio_data).decode())
                 _audio_ever_sent = True
 
-                # ---- 视频发送（CostController 驱动） ----
+                # ---- 视频发送 ----
+                # 策略：说话开始瞬间立刻发一帧（不等转录），让模型提前看到画面
+                # 后续按 CostController 帧率控制
                 if camera and _audio_ever_sent and not _in_standby:
                     now = time.time()
                     fps = controller.get_current_fps()
-                    if now - last_video_send >= 1.0 / fps:
-                        user_text = bot.callback.latest_user_text or ""
-                        bot.callback.latest_user_text = ""
-                        if controller.should_send_video(user_text):
-                            b64 = camera.get_frame_base64()
-                            if b64:
-                                bot.send_video_frame(b64)
-                                last_video_send = now
-                                status = "闲置保活" if controller.is_idle() else "意图触发"
-                                print(f"[📷 视觉] 发送画面 ({status}, {fps}fps)")
+                    should_send = False
+
+                    if speech_onset and not _first_frame_sent:
+                        # 刚开始说话 → 立刻发送首帧
+                        should_send = True
+                        _first_frame_sent = True
+                    elif now - last_video_send >= 1.0 / fps:
+                        # 按帧率发送后续帧
+                        should_send = True
+
+                    if should_send:
+                        b64 = camera.get_frame_base64()
+                        if b64:
+                            bot.send_video_frame(b64)
+                            last_video_send = now
+                            tag = "首帧" if speech_onset else ("闲置保活" if controller.is_idle() else "意图触发")
+                            if speech_onset:
+                                print(f"[📷 视觉] 发送画面 ({tag}, {fps}fps)")
+                            elif _frame_count % 50 == 0:
+                                print(f"[📷 视觉] 发送画面 ({tag}, {fps}fps)")
         else:
             # ---- 无语音 ----
             _wakeup_counter = 0
+            _first_frame_sent = False  # 本轮说话结束，下次说话重新发首帧
 
             if not _in_standby:
                 silent_duration = time.time() - _silence_start
@@ -244,4 +277,5 @@ def run_auto_mode(bot, camera, controller):
 
                 controller.update_idle_timer(is_speaking=False)
 
+        _was_speaking = is_speaking_now
         time.sleep(0.01)
