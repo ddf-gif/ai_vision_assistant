@@ -17,6 +17,7 @@ if sys.platform == "win32":
 from dotenv import load_dotenv
 
 from camera import Camera
+from controller import CostController
 from realtime_bot import RealtimeBot
 
 # ---------- 加载环境变量 ----------
@@ -92,6 +93,10 @@ def main():
         print(f"⚠️ 摄像头初始化失败: {e}")
         print("   将以纯语音模式运行（无视觉输入）")
 
+    # 初始化成本控制器（意图过滤 + 帧率动态调节）
+    cost_ctrl = CostController()
+    print("💰 成本控制器已就绪 (活跃:1fps, 闲置:0.1fps, 超时:30s)")
+
     # 创建视觉语音对话机器人
     bot = RealtimeBot(
         api_key=DASHSCOPE_API_KEY,
@@ -103,6 +108,7 @@ def main():
         enable_voice_interrupt=ENABLE_VOICE_INTERRUPT,
         camera=camera,
         video_interval=VIDEO_INTERVAL,
+        cost_controller=cost_ctrl,
     )
 
     try:
