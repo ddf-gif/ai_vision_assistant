@@ -36,7 +36,7 @@ def run_manual_mode(bot, camera, controller):
     """
     print("=" * 50)
     print("🎧 手动模式：按 [空格键] 切换录音（开/关）")
-    print("   [ESC] 退出对话")
+    print("   [ESC] AI 说话时打断，未说话时退出对话")
     print("=" * 50)
 
     push_to_talk = False
@@ -60,9 +60,12 @@ def run_manual_mode(bot, camera, controller):
         # ---- 键盘检测 ----
         key = cv2.waitKey(1) & 0xFF
 
-        if key == 27:  # ESC 退出
-            print("\n[系统] ESC 按下，退出对话")
-            break
+        if key == 27:  # ESC：AI 说话时打断，否则退出
+            if bot.callback and bot.callback.assistant_speaking:
+                bot._do_interrupt()
+            else:
+                print("\n[系统] ESC 按下，退出对话")
+                break
 
         # ---- 空格键边沿检测（按下瞬间切换）----
         space_pressed = (key == 32)
@@ -139,7 +142,7 @@ def run_auto_mode(bot, camera, controller):
     print("=" * 50)
     print("🎧 自动模式：VAD 语音检测，自动判断说话/静音")
     print(f"   待机超时: {_STANDBY_TIMEOUT:.0f} 秒无语音后关闭摄像头")
-    print("   [ESC] 退出对话")
+    print("   [ESC] AI 说话时打断，未说话时退出对话")
     print("=" * 50)
 
     last_video_send = 0.0
@@ -164,9 +167,12 @@ def run_auto_mode(bot, camera, controller):
 
         # ---- 键盘检测 ----
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC 退出
-            print("\n[系统] ESC 按下，退出对话")
-            break
+        if key == 27:  # ESC：AI 说话时打断，否则退出
+            if bot.callback and bot.callback.assistant_speaking:
+                bot._do_interrupt()
+            else:
+                print("\n[系统] ESC 按下，退出对话")
+                break
 
         # ---- 读取麦克风音频 ----
         try:
@@ -176,7 +182,7 @@ def run_auto_mode(bot, camera, controller):
             continue
 
         # ---- VAD 语音检测 ----
-        energy = len(audio_data) // 2  # 仅用于下面的调试输出，实际能量在 detect_speech_energy 内计算
+        energy = len(audio_data) // 2  # 仅用于下面的调试输出
         is_speaking_now = detect_speech_energy(audio_data, _SPEECH_THRESHOLD)
 
         # 每 50 帧（≈1 秒）打印一次能量，帮助校准阈值
