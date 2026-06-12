@@ -1,5 +1,6 @@
 dashscope>=1.23.9
 opencv-python>=4.5
 numpy
+Pillow
 pyaudio
 python-dotenv
